@@ -61,6 +61,12 @@ VIDEO_EXTS = {
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".aiff", ".aif"}
 DEFAULT_PRESERVE_EXTS = {".gif"}
 MEDIA_REL_MARKERS = ("/video", "/audio", "/media")
+BACKGROUND_EXTS = {".png", ".jpg", ".jpeg"}
+IMAGE_CONTENT_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+}
 
 
 class ExportError(RuntimeError):
@@ -113,6 +119,24 @@ def rasterize_pdf(pdf: Path, out_dir: Path, dpi: int, pdftoppm: Optional[str]) -
     pages = sorted(out_dir.glob("slide-*.png"), key=natural_key)
     if not pages:
         raise ExportError("pdftoppm completed but no PNG pages were created.")
+    return pages
+
+
+def collect_background_images(background_dir: Path) -> List[Path]:
+    if not background_dir.exists() or not background_dir.is_dir():
+        raise ExportError(f"Background image directory does not exist: {background_dir}")
+    pages = sorted(
+        [
+            p
+            for p in background_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in BACKGROUND_EXTS
+        ],
+        key=natural_key,
+    )
+    if not pages:
+        raise ExportError(
+            f"No background images found in {background_dir}. Use PNG/JPG files, one per slide."
+        )
     return pages
 
 
@@ -344,13 +368,38 @@ def build_device_safe_deck(args: argparse.Namespace) -> Dict[str, object]:
         media_tmp = temp_dir / "media"
         media_tmp.mkdir()
 
+        render_warnings: List[str] = []
+        if args.pdf and args.background_dir:
+            raise ExportError("Use either --pdf or --background-dir, not both.")
         if args.pdf:
             pdf = Path(args.pdf).expanduser().resolve()
             if not pdf.exists():
                 raise ExportError(f"PDF render source does not exist: {pdf}")
-        else:
+            pages = rasterize_pdf(pdf, render_dir, args.dpi, args.pdftoppm)
+            render_source_type = "trusted_pdf"
+            render_source = str(pdf)
+        elif args.background_dir:
+            background_dir = Path(args.background_dir).expanduser().resolve()
+            pages = collect_background_images(background_dir)
+            render_source_type = "trusted_images"
+            render_source = str(background_dir)
+            pdf = None
+        elif args.allow_soffice_renderer:
             pdf = export_pdf_with_soffice(input_pptx, pdf_dir, args.soffice)
-        pages = rasterize_pdf(pdf, render_dir, args.dpi, args.pdftoppm)
+            pages = rasterize_pdf(pdf, render_dir, args.dpi, args.pdftoppm)
+            render_source_type = "untrusted_soffice"
+            render_source = str(pdf)
+            render_warnings.append(
+                "Used LibreOffice/OpenOffice soffice to render the PPTX. "
+                "This may not match WPS, PowerPoint, or Keynote rendering."
+            )
+        else:
+            raise ExportError(
+                "No trusted visual source was provided. Export the deck to PDF from the "
+                "presentation app whose appearance you trust, then pass --pdf; or pass "
+                "--background-dir with one PNG/JPG per slide. Use --allow-soffice-renderer "
+                "only for a draft when you accept possible layout drift."
+            )
 
         preserve_exts = {
             ext.lower() if ext.startswith(".") else "." + ext.lower()
@@ -360,7 +409,7 @@ def build_device_safe_deck(args: argparse.Namespace) -> Dict[str, object]:
         modified: Dict[str, bytes] = {}
         added_files: Dict[str, Path] = {}
         converted_media: Dict[str, str] = {}
-        conversion_warnings: List[str] = []
+        conversion_warnings: List[str] = list(render_warnings)
         preserved_report: List[Dict[str, object]] = []
         slide_reports: List[Dict[str, object]] = []
 
@@ -394,7 +443,10 @@ def build_device_safe_deck(args: argparse.Namespace) -> Dict[str, object]:
                     if timing is not None:
                         slide_root.remove(timing)
 
-                bg_name = f"device_safe_slide_{slide_index:02d}.png"
+                bg_ext = pages[slide_index - 1].suffix.lower().lstrip(".")
+                if bg_ext == "jpg":
+                    bg_ext = "jpeg"
+                bg_name = f"device_safe_slide_{slide_index:02d}.{bg_ext}"
                 bg_arc = f"ppt/media/{bg_name}"
                 added_files[bg_arc] = pages[slide_index - 1]
                 bg_rid = next_rid(rels, max_rid)
@@ -484,7 +536,15 @@ def build_device_safe_deck(args: argparse.Namespace) -> Dict[str, object]:
                 add_content_type_defaults(
                     ct_root,
                     {
-                        "png": "image/png",
+                        **{
+                            ext: IMAGE_CONTENT_TYPES[ext]
+                            for ext in sorted(
+                                {
+                                    ("jpeg" if page.suffix.lower() == ".jpg" else page.suffix.lower().lstrip("."))
+                                    for page in pages
+                                }
+                            )
+                        },
                         "mp4": "video/mp4",
                     },
                 )
@@ -518,7 +578,9 @@ def build_device_safe_deck(args: argparse.Namespace) -> Dict[str, object]:
         report = {
             "input": str(input_pptx),
             "output": str(output),
-            "pdf_source": str(pdf),
+            "render_source_type": render_source_type,
+            "render_source": render_source,
+            "pdf_source": str(pdf) if pdf else None,
             "slide_count": len(pages),
             "dpi": args.dpi,
             "preserved_media": preserved_report,
@@ -540,10 +602,22 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("input", help="Source .pptx file")
     parser.add_argument("--output", required=True, help="Output .pptx file")
-    parser.add_argument("--pdf", help="Optional already-verified PDF render of the deck")
+    parser.add_argument(
+        "--pdf",
+        help="Trusted PDF render of the deck, exported from the presentation app whose appearance should be preserved",
+    )
+    parser.add_argument(
+        "--background-dir",
+        help="Trusted directory containing one PNG/JPG background image per slide, in slide order",
+    )
     parser.add_argument("--report", help="Optional JSON report path")
     parser.add_argument("--dpi", type=int, default=144, help="Rasterization DPI for slide backgrounds")
-    parser.add_argument("--soffice", help="Path to soffice when --pdf is not provided")
+    parser.add_argument(
+        "--allow-soffice-renderer",
+        action="store_true",
+        help="Allow LibreOffice/OpenOffice to render PPTX to PDF. This is a fallback and may not match WPS/PowerPoint.",
+    )
+    parser.add_argument("--soffice", help="Path to soffice when --allow-soffice-renderer is used")
     parser.add_argument("--pdftoppm", help="Path to pdftoppm")
     parser.add_argument(
         "--preserve-ext",

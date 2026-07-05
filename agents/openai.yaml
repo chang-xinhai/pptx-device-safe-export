@@ -1,4 +1,4 @@
 interface:
   display_name: "PPTX Device-Safe Export"
-  short_description: "Flatten PPTX pages while preserving playable media"
-  default_prompt: "Use $pptx-device-safe-export to create a cross-device safe PPTX for presenting on another computer."
+  short_description: "Flatten PPTX from a trusted render while preserving media"
+  default_prompt: "Use $pptx-device-safe-export with my PPTX and a trusted PDF export to create a cross-device safe presentation."
